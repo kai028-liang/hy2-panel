@@ -61,12 +61,29 @@
   <div class="msg" id="msg"></div>
 
   <div class="card">
-    <h2>➕ 新建规则（hy2 入站端口 → 出口代理）</h2>
+    <h2>➕ 新建规则（入站协议 + 端口 → 出口代理）</h2>
     <div class="row">
       <div><label>备注名称</label><input id="fName" placeholder="如：美国线路"></div>
+      <div><label>入站协议</label><select id="fProto" onchange="toggleProtoFields()">
+        <option value="hy2">hy2 (Hysteria2)</option>
+        <option value="ss">ss (Shadowsocks 2022)</option>
+        <option value="trojan">trojan (TLS)</option>
+        <option value="vless">vless (REALITY 伪装)</option>
+      </select></div>
       <div><label>入站端口</label><input id="fPort" placeholder="如 8443" type="number"></div>
-      <div><label>hy2 密码</label><input id="fPwd" placeholder="入站连接密码"></div>
-      <div><label>混淆 (obfs)</label><select id="fObfs"><option value="">关闭</option><option value="1">开启 (salamander)</option></select></div>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <div class="protoField" data-p="hy2"><label>hy2 密码</label><input id="fPwd" placeholder="入站连接密码"></div>
+      <div class="protoField" data-p="hy2"><label>混淆 (obfs)</label><select id="fObfs"><option value="">关闭</option><option value="1">开启 (salamander)</option></select></div>
+      <div class="protoField" data-p="ss"><label>ss 加密</label><select id="fSsMethod">
+        <option value="2022-blake3-aes-128-gcm">2022-blake3-aes-128-gcm（推荐）</option>
+        <option value="2022-blake3-aes-256-gcm">2022-blake3-aes-256-gcm</option>
+        <option value="aes-256-gcm">aes-256-gcm（兼容旧客户端）</option>
+      </select></div>
+      <div class="protoField" data-p="ss"><label class="hint" style="margin:0;padding-top:22px">密钥自动生成</label></div>
+      <div class="protoField" data-p="trojan"><label>trojan 密码</label><input id="fPwdTrojan" placeholder="入站连接密码"></div>
+      <div class="protoField" data-p="vless"><label>REALITY 伪装站</label><select id="fReality"></select></div>
+      <div class="protoField" data-p="vless"><label class="hint" style="margin:0;padding-top:22px">密钥/UUID 自动生成</label></div>
     </div>
     <div class="row" style="margin-top:10px">
       <div><label>出口类型</label><select id="fOutType" onchange="toggleOutFields()">
@@ -86,7 +103,7 @@
   <div class="card">
     <h2>📋 规则列表</h2>
     <table>
-      <thead><tr><th>名称</th><th>入站端口</th><th>出口</th><th>混淆</th><th>操作</th></tr></thead>
+      <thead><tr><th>名称</th><th>协议</th><th>入站端口</th><th>出口</th><th>伪装/加密</th><th>操作</th></tr></thead>
       <tbody id="rulesBody"></tbody>
     </table>
   </div>
@@ -137,32 +154,53 @@ function toggleOutFields() {
   document.querySelectorAll('.outField').forEach(e => e.style.display = show ? '' : 'none');
 }
 
+function toggleProtoFields() {
+  const p = $('fProto').value;
+  document.querySelectorAll('.protoField').forEach(e =>
+    e.style.display = e.dataset.p === p ? '' : 'none');
+}
+
+const PROTO_LABEL = { hy2: 'hy2', ss: 'ss', trojan: 'trojan', vless: 'vless-REALITY' };
+function protoDisguise(r) {
+  if (r.proto === 'hy2') return r.obfs ? 'salamander 混淆' : '—';
+  if (r.proto === 'ss') return (r.ss_method || '').replace('-gcm','');
+  if (r.proto === 'trojan') return 'TLS';
+  if (r.proto === 'vless') return 'REALITY → ' + (r.reality_preset || 'microsoft');
+  return '—';
+}
+
 async function loadRules() {
   const { data } = await api('/api/rules');
   const tb = $('rulesBody'); tb.innerHTML = '';
   for (const r of data.rules || []) {
     const out = r.out_type === 'direct' ? 'direct（本机出口）' : `${r.out_type} → ${r.out_server}:${r.out_port}`;
     tb.insertAdjacentHTML('beforeend', `<tr>
-      <td>${r.name || '-'}</td><td>${r.listen_port}</td>
+      <td>${r.name || '-'}</td>
+      <td><span class="tag">${PROTO_LABEL[r.proto || 'hy2']}</span></td>
+      <td>${r.listen_port}</td>
       <td><span class="tag">${out}</span></td>
-      <td>${r.obfs ? '✅' : '—'}</td>
+      <td>${protoDisguise(r)}</td>
       <td><button class="btn-danger" onclick="delRule('${r.id}')">删除</button></td>
     </tr>`);
   }
 }
 
 async function addRule() {
+  const proto = $('fProto').value;
   const rule = {
     name: $('fName').value,
+    proto: proto,
     listen_port: parseInt($('fPort').value),
-    password: $('fPwd').value,
-    obfs: $('fObfs').value === '1',
     out_type: $('fOutType').value,
     out_server: $('fOutServer').value,
     out_port: $('fOutPort').value,
     out_username: $('fOutUser').value,
     out_password: $('fOutPwd').value
   };
+  if (proto === 'hy2') { rule.password = $('fPwd').value; rule.obfs = $('fObfs').value === '1'; }
+  if (proto === 'ss') rule.ss_method = $('fSsMethod').value;
+  if (proto === 'trojan') rule.password = $('fPwdTrojan').value;
+  if (proto === 'vless') rule.reality_preset = $('fReality').value;
   const { data } = await api('/api/rules', rule);
   if (data.ok) { msg('规则已添加', true); loadRules(); }
   else msg(data.error || '添加失败', false);
@@ -180,7 +218,7 @@ async function genConfig() {
   msg('配置已生成', true);
   const area = $('linksArea'); area.innerHTML = '<h2 style="font-size:13px;color:#93b4ff;margin-bottom:8px">客户端链接（按端口对应不同出口）</h2>';
   for (const l of data.links) {
-    area.insertAdjacentHTML('beforeend', `<div class="link-row"><span class="tag">${l.name} :${l.port}</span><code>${l.url}</code><button class="btn-sm" onclick="navigator.clipboard.writeText('${l.url}');this.textContent='已复制'">复制</button></div>`);
+    area.insertAdjacentHTML('beforeend', `<div class="link-row"><span class="tag">${l.proto || 'hy2'} · ${l.name} :${l.port}</span><code>${l.url}</code><button class="btn-sm" onclick="navigator.clipboard.writeText('${l.url}');this.textContent='已复制'">复制</button></div>`);
   }
   $('cfgArea').innerHTML = `<button class="btn-sm" onclick='downloadCfg()'>⬇ 下载 config.json</button><span class="hint"> 部署时上传到服务器 /etc/hy2/config.json</span>`;
   window._cfg = data.config;
@@ -191,12 +229,22 @@ function downloadCfg() {
   a.href = URL.createObjectURL(blob); a.download = 'config.json'; a.click();
 }
 
+async function loadPresets() {
+  const { data } = await api('/api/presets');
+  const sel = $('fReality');
+  for (const p of data.reality || []) {
+    sel.insertAdjacentHTML('beforeend', `<option value="${p.id}">${p.name} (${p.server})</option>`);
+  }
+}
+
 (async () => {
   const { data } = await api('/api/me');
   if (data.user) {
     $('loginBox').style.display = 'none';
     $('app').style.display = 'block';
     $('whoami').textContent = '👤 ' + data.user;
+    toggleProtoFields();
+    loadPresets();
     loadRules();
   }
 })();

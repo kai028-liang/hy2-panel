@@ -3,12 +3,15 @@
 
 功能：
 - 账号密码登录（session）
-- 管理规则：hy2 入站端口 -> 上游代理出口（不同端口流量从不同代理 IP 出去）
-- 自动生成自签证书
-- 生成 sing-box 配置（hy2 多端口入站 + 按入站 tag 分流出站）
+- 管理规则：入站协议+端口 -> 上游代理出口（不同端口流量从不同代理 IP 出去）
+- 入站协议：hy2 / ss(Shadowsocks) / trojan / vless+REALITY
+- 自动生成自签证书、REALITY 密钥对
+- 生成 sing-box 配置（多端口入站 + 按入站 tag 分流出站）
 """
 import os
 import json
+import base64
+import uuid
 import shutil
 import secrets
 import subprocess
@@ -21,6 +24,7 @@ DATA_DIR = os.path.join(BASE, "data")
 CERT_DIR = os.path.join(DATA_DIR, "certs")
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
 RULES_FILE = os.path.join(DATA_DIR, "rules.json")
+REALITY_FILE = os.path.join(DATA_DIR, "reality.json")
 GEN_DIR = os.path.join(DATA_DIR, "generated")
 
 for d in (DATA_DIR, CERT_DIR, GEN_DIR):
@@ -125,6 +129,52 @@ def ensure_cert(cert_dir=CERT_DIR, cn="hy2.local"):
     return cert, key
 
 
+# ---------- REALITY ----------
+# 伪装目标站预设（可随时切换）：要求目标站支持 TLS1.3 + H2，且不在墙黑名单
+REALITY_PRESETS = [
+    {"id": "microsoft", "name": "Microsoft", "server": "www.microsoft.com", "server_port": 443},
+    {"id": "apple", "name": "Apple", "server": "www.apple.com", "server_port": 443},
+    {"id": "yahoo", "name": "Yahoo", "server": "www.yahoo.com", "server_port": 443},
+    {"id": "bing", "name": "Bing", "server": "www.bing.com", "server_port": 443},
+    {"id": "samsung", "name": "Samsung", "server": "www.samsung.com", "server_port": 443},
+]
+
+
+def ensure_reality():
+    """REALITY 密钥对（X25519），只生成一次存盘；优先用 cryptography 库，退回 sing-box CLI"""
+    if os.path.exists(REALITY_FILE):
+        with open(REALITY_FILE) as f:
+            return json.load(f)
+    try:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+        priv = X25519PrivateKey.generate()
+        b = priv.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw,
+                               serialization.NoEncryption())
+        pub = priv.public_key().public_bytes(serialization.Encoding.Raw,
+                                             serialization.PublicFormat.Raw)
+        u = lambda raw: base64.urlsafe_b64encode(raw).decode().rstrip("=")
+        data = {"private_key": u(b), "public_key": u(pub), "short_id": secrets.token_hex(8)}
+    except (ImportError, FileNotFoundError, subprocess.CalledProcessError, json.JSONDecodeError):
+        p = subprocess.run(["sing-box", "generate", "reality-keypair"],
+                           capture_output=True, text=True)
+        if p.returncode != 0:
+            raise RuntimeError("无法生成 REALITY 密钥：缺 cryptography 库且 sing-box 不可用")
+        d = json.loads(p.stdout)
+        data = {"private_key": d["PrivateKey"], "public_key": d["PublicKey"],
+                "short_id": secrets.token_hex(8)}
+    with open(REALITY_FILE, "w") as f:
+        json.dump(data, f)
+    return data
+
+
+def get_reality_preset(pid):
+    for p in REALITY_PRESETS:
+        if p["id"] == pid:
+            return p
+    return REALITY_PRESETS[0]
+
+
 # ---------- 规则 ----------
 def load_rules():
     if not os.path.exists(RULES_FILE):
@@ -140,17 +190,26 @@ def save_rules(data):
 
 
 VALID_OUT_TYPES = {"direct", "socks", "http", "hy2"}
+VALID_PROTOS = {"hy2", "ss", "trojan", "vless"}
+SS_METHODS = {"2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm", "aes-256-gcm"}
 
 
 def validate_rule(r):
+    proto = r.get("proto", "hy2")
+    if proto not in VALID_PROTOS:
+        return "协议必须是 hy2/ss/trojan/vless"
     try:
         port = int(r["listen_port"])
         if not (1 <= port <= 65535):
             raise ValueError
     except (KeyError, ValueError, TypeError):
         return "入站端口必须是 1-65535 的整数"
-    if r.get("password", "") == "":
-        return "hy2 密码不能为空"
+    if proto in ("hy2", "trojan") and r.get("password", "") == "":
+        return "连接密码不能为空"
+    if proto == "ss" and r.get("ss_method") not in SS_METHODS:
+        return "ss 加密方式无效"
+    if proto == "vless" and r.get("reality_preset") not in {p["id"] for p in REALITY_PRESETS}:
+        return "REALITY 伪装预设无效"
     t = r.get("out_type")
     if t not in VALID_OUT_TYPES:
         return "出口类型必须是 direct/socks/http/hy2"
@@ -170,6 +229,12 @@ def get_rules():
     return jsonify(load_rules())
 
 
+@app.get("/api/presets")
+@login_required
+def presets():
+    return jsonify({"reality": REALITY_PRESETS})
+
+
 @app.post("/api/rules")
 @login_required
 def add_rule():
@@ -181,7 +246,13 @@ def add_rule():
     if any(x["listen_port"] == int(r["listen_port"]) for x in data["rules"]):
         return jsonify({"error": "入站端口已存在"}), 400
     r["listen_port"] = int(r["listen_port"])
+    r["proto"] = r.get("proto", "hy2")
     r["obfs"] = bool(r.get("obfs", False))
+    # 各协议的密钥/凭据：ss 自动生成 2022 密钥，vless 自动生成 uuid
+    if r["proto"] == "ss" and not r.get("ss_key"):
+        r["ss_key"] = base64.b64encode(secrets.token_bytes(16 if "128" in r["ss_method"] else 32)).decode()
+    if r["proto"] == "vless" and not r.get("uuid"):
+        r["uuid"] = str(uuid.uuid4())
     r["id"] = secrets.token_hex(4)
     data["rules"].append(r)
     save_rules(data)
@@ -224,16 +295,11 @@ def del_rule(rid):
 
 
 # ---------- sing-box 配置生成 ----------
-def build_singbox_config(rules, server_ip):
-    ensure_cert()
-    inbounds = []
-    outbounds = [{"type": "direct", "tag": "direct"}]
-    route_rules = []
-    used_out_tags = {"direct"}
-
-    for r in rules:
-        itag = f"in-{r['listen_port']}"
-        otag = f"out-{r['listen_port']}"
+def build_inbound(r):
+    """按协议生成单个入站配置"""
+    itag = f"in-{r['listen_port']}"
+    proto = r.get("proto", "hy2")
+    if proto == "hy2":
         inbound = {
             "type": "hysteria2",
             "tag": itag,
@@ -249,7 +315,64 @@ def build_singbox_config(rules, server_ip):
         }
         if r.get("obfs"):
             inbound["obfs"] = {"type": "salamander", "password": r["password"]}
-        inbounds.append(inbound)
+        return inbound
+    if proto == "ss":
+        return {
+            "type": "shadowsocks",
+            "tag": itag,
+            "listen": "::",
+            "listen_port": r["listen_port"],
+            "method": r["ss_method"],
+            "password": r["ss_key"],
+        }
+    if proto == "trojan":
+        return {
+            "type": "trojan",
+            "tag": itag,
+            "listen": "::",
+            "listen_port": r["listen_port"],
+            "users": [{"password": r["password"]}],
+            "tls": {
+                "enabled": True,
+                "server_name": "hy2.local",
+                "certificate_path": "/etc/hy2/cert.pem",
+                "key_path": "/etc/hy2/key.pem",
+            },
+        }
+    if proto == "vless":
+        preset = get_reality_preset(r.get("reality_preset"))
+        reality = ensure_reality()
+        return {
+            "type": "vless",
+            "tag": itag,
+            "listen": "::",
+            "listen_port": r["listen_port"],
+            "users": [{"uuid": r["uuid"], "flow": "xtls-rprx-vision"}],
+            "tls": {
+                "enabled": True,
+                "server_name": preset["server"],
+                "reality": {
+                    "enabled": True,
+                    "handshake": {"server": preset["server"], "server_port": preset["server_port"]},
+                    "private_key": reality["private_key"],
+                    "short_id": [reality["short_id"]],
+                },
+            },
+        }
+    raise ValueError(f"未知协议: {proto}")
+
+
+def build_singbox_config(rules, server_ip):
+    ensure_cert()
+    inbounds = []
+    outbounds = [{"type": "direct", "tag": "direct"}]
+    route_rules = []
+    used_out_tags = {"direct"}
+
+    for r in rules:
+        itag = f"in-{r['listen_port']}"
+        otag = f"out-{r['listen_port']}"
+        inbounds.append(build_inbound(r))
 
         t = r["out_type"]
         if t == "direct":
@@ -287,22 +410,37 @@ def build_singbox_config(rules, server_ip):
 
 
 def build_client_links(rules, server_ip):
-    """生成每条规则的 hy2 客户端分享链接"""
+    """生成每条规则的客户端分享链接（按协议）"""
+    import urllib.parse
     links = []
     for r in rules:
-        import urllib.parse
-        pwd = urllib.parse.quote(r["password"], safe="")
-        params = {"insecure": "1", "sni": "hy2.local"}
-        if r.get("obfs"):
-            params["obfs"] = "salamander"
-            params["obfs-password"] = pwd
-        q = "&".join(f"{k}={v}" for k, v in params.items())
-        links.append({
-            "id": r["id"],
-            "port": r["listen_port"],
-            "name": r.get("name", f"hy2-{r['listen_port']}"),
-            "url": f"hy2://{pwd}@{server_ip}:{r['listen_port']}?{q}#{urllib.parse.quote(r.get('name', f'hy2-{r['listen_port']}'))}"
-        })
+        pwd = urllib.parse.quote(r.get("password", ""), safe="")
+        port = r["listen_port"]
+        name = r.get("name", f"{r.get('proto', 'hy2')}-{port}")
+        tag = urllib.parse.quote(name)
+        proto = r.get("proto", "hy2")
+        if proto == "hy2":
+            params = {"insecure": "1", "sni": "hy2.local"}
+            if r.get("obfs"):
+                params["obfs"] = "salamander"
+                params["obfs-password"] = pwd
+            q = "&".join(f"{k}={v}" for k, v in params.items())
+            url = f"hy2://{pwd}@{server_ip}:{port}?{q}#{tag}"
+        elif proto == "ss":
+            userinfo = base64.urlsafe_b64encode(
+                f"{r['ss_method']}:{r['ss_key']}".encode()).decode().rstrip("=")
+            url = f"ss://{userinfo}@{server_ip}:{port}#{tag}"
+        elif proto == "trojan":
+            url = (f"trojan://{pwd}@{server_ip}:{port}"
+                   f"?security=tls&sni=hy2.local&allowInsecure=1#{tag}")
+        else:  # vless + REALITY
+            preset = get_reality_preset(r.get("reality_preset"))
+            reality = ensure_reality()
+            url = (f"vless://{r['uuid']}@{server_ip}:{port}"
+                   f"?encryption=none&flow=xtls-rprx-vision&security=reality"
+                   f"&sni={preset['server']}&fp=chrome&pbk={reality['public_key']}"
+                   f"&sid={reality['short_id']}&type=tcp#{tag}")
+        links.append({"id": r["id"], "port": port, "proto": proto, "name": name, "url": url})
     return links
 
 
