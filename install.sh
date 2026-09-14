@@ -109,7 +109,9 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now hy2 hy2-panel
+systemctl enable hy2 hy2-panel >/dev/null 2>&1
+# enable --now 对已运行服务是空操作，升级时必须 restart 才会加载新代码
+systemctl restart hy2 hy2-panel
 sleep 1
 systemctl is-active hy2 >/dev/null && echo "hy2 服务已启动"
 systemctl is-active hy2-panel >/dev/null && echo "hy2-panel 服务已启动"
