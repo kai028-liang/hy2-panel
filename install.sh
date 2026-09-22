@@ -12,7 +12,7 @@ echo "=== 1. 安装系统依赖 ==="
 if command -v apt-get >/dev/null; then
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
-  apt-get install -y -qq python3 python3-venv openssl curl >/dev/null
+  apt-get install -y -qq python3 python3-venv python3-pip openssl curl >/dev/null
 elif command -v dnf >/dev/null; then
   dnf install -y -q python3 python3-pip openssl curl >/dev/null
 else
@@ -27,10 +27,23 @@ case "$ARCH" in
   *) echo "不支持的架构: $ARCH"; exit 1 ;;
 esac
 if ! command -v sing-box >/dev/null; then
-  curl -fsSL -o /tmp/sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VER}/sing-box-${SINGBOX_VER}-linux-${ARCH}.tar.gz"
+  SB_URL="https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VER}/sing-box-${SINGBOX_VER}-linux-${ARCH}.tar.gz"
+  # 国内小鸡到 GitHub 的下载经常闪断(curl error 18 这类 HTTP/2 流错误), 强制 HTTP/1.1 + 重试 + 镜像兜底
+  dl_sb() {
+    local url="$1" i
+    for i in 1 2 3; do
+      curl -fsSL --http1.1 --connect-timeout 15 -m 300 -o /tmp/sing-box.tar.gz "$url" && return 0
+      echo "  下载失败(第 $i 次), 重试..."
+      sleep 2
+    done
+    return 1
+  }
+  dl_sb "$SB_URL" || dl_sb "https://gh-proxy.com/$SB_URL" \
+    || { echo "sing-box 下载失败(GitHub 直连与镜像均不可达), 请检查网络后重跑"; exit 1; }
   tar -xzf /tmp/sing-box.tar.gz -C /tmp
   cp /tmp/sing-box-*/sing-box /usr/local/bin/
   chmod +x /usr/local/bin/sing-box
+  rm -f /tmp/sing-box.tar.gz
 fi
 sing-box version | head -1
 
@@ -45,10 +58,65 @@ INDEX_EOF
 mkdir -p "$PANEL_DIR/data"
 
 echo "=== 4. Python 虚拟环境 ==="
-if [ ! -x "$PANEL_DIR/venv/bin/python" ]; then
-  python3 -m venv "$PANEL_DIR/venv"
+# 固定用系统 python3：PATH 里其它来源的 python3（面板/宝塔自带的）常缺 ensurepip，
+# 用它建 venv 会得到一个"有 python 没有 pip"的半成品
+BASEPY=/usr/bin/python3
+[ -x "$BASEPY" ] || BASEPY=$(command -v python3 2>/dev/null) || { echo "找不到 python3"; exit 1; }
+PYVER=$("$BASEPY" -c 'import sys;print("%d.%d"%sys.version_info[:2])')
+echo "使用解释器: $BASEPY (Python $PYVER)"
+
+# venv 里的 pip 由 ensurepip 提供，缺了就先按实际版本号补装对应的 -venv 包
+if ! "$BASEPY" -c 'import ensurepip' >/dev/null 2>&1; then
+  echo "Python $PYVER 缺少 ensurepip, 尝试安装 python3-venv ..."
+  if command -v apt-get >/dev/null; then
+    apt-get install -y -qq python3-venv "python3.${PYVER#3.}-venv" python3-pip >/dev/null 2>&1 || true
+  elif command -v dnf >/dev/null; then
+    dnf install -y -q python3-pip >/dev/null 2>&1 || true
+  fi
 fi
-"$PANEL_DIR/venv/bin/pip" install -q flask cryptography
+
+VENV="$PANEL_DIR/venv"
+# 判据必须是"pip 能不能用"。venv 建失败时会把 bin/python（指向 /usr/bin/python3 的
+# 符号链接）留在原地，只检查 bin/python 会被它骗过去，然后卡在 pip: No such file or directory
+if [ -x "$VENV/bin/python" ] && ! "$VENV/bin/python" -m pip --version >/dev/null 2>&1; then
+  echo "发现不完整的 venv(缺 pip), 删除重建 ..."
+  rm -rf "$VENV"
+fi
+[ -x "$VENV/bin/python" ] || "$BASEPY" -m venv "$VENV" || { rm -rf "$VENV"; true; }
+if [ -x "$VENV/bin/python" ]; then
+  "$VENV/bin/python" -m pip --version >/dev/null 2>&1 \
+    || "$VENV/bin/python" -m ensurepip --upgrade --default-pip >/dev/null 2>&1 || true
+fi
+
+# 优先用 venv 里的 pip；PyPI 直连不通时（国内小鸡常见）依次换清华/阿里镜像；
+# 都不行再退回系统 python3 + --break-system-packages
+pip_try() {  # pip_try <解释器> [额外的pip参数...]
+  local py="$1"; shift
+  local src
+  for src in "" "https://pypi.tuna.tsinghua.edu.cn/simple" "https://mirrors.aliyun.com/pypi/simple"; do
+    if [ -z "$src" ]; then
+      "$py" -m pip install -q --timeout 20 --retries 2 "$@" flask cryptography >>/tmp/hy2-pip.log 2>&1 && return 0
+    else
+      echo "  换源重试: $src"
+      "$py" -m pip install -q --timeout 20 --retries 2 -i "$src" "$@" flask cryptography >>/tmp/hy2-pip.log 2>&1 && return 0
+    fi
+  done
+  return 1
+}
+
+PANEL_PY=""
+if [ -x "$VENV/bin/python" ] && "$VENV/bin/python" -m pip --version >/dev/null 2>&1; then
+  if pip_try "$VENV/bin/python"; then
+    "$VENV/bin/python" -c 'import flask, cryptography' >/dev/null 2>&1 && PANEL_PY="$VENV/bin/python"
+  fi
+fi
+if [ -z "$PANEL_PY" ]; then
+  echo "venv 不可用, 退回系统 python3 安装依赖 ..."
+  pip_try "$BASEPY" || pip_try "$BASEPY" --break-system-packages || true
+  "$BASEPY" -c 'import flask, cryptography' >/dev/null 2>&1 && PANEL_PY="$BASEPY"
+fi
+[ -n "$PANEL_PY" ] || { echo "Python 依赖安装失败, 日志末尾:"; tail -20 /tmp/hy2-pip.log 2>/dev/null; exit 1; }
+echo "面板运行解释器: $PANEL_PY"
 
 echo "=== 5. 证书（自签） ==="
 mkdir -p /etc/hy2
@@ -73,6 +141,20 @@ sing-box check -c /etc/hy2/config.json && echo "配置校验通过"
 echo "=== 7. systemd 服务 ==="
 # 公网 IP（供面板生成分享链接）
 SERVER_IP=$(curl -fs -m 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')
+
+# Docker/LXC 容器里通常没有 systemd，硬走 systemctl 会在装完前一步失败
+if ! command -v systemctl >/dev/null 2>&1; then
+  echo "未检测到 systemd（容器里常见），无法注册开机自启，改为直接后台启动："
+  nohup /usr/local/bin/sing-box run -c /etc/hy2/config.json >/var/log/hy2.log 2>&1 &
+  cd "$PANEL_DIR" && HY2_SERVER_IP="$SERVER_IP" PANEL_PORT=5090 nohup "$PANEL_PY" app.py >/var/log/hy2-panel.log 2>&1 &
+  sleep 2
+  echo "日志: /var/log/hy2.log 和 /var/log/hy2-panel.log"
+  echo ""
+  echo "=== 安装完成（无 systemd，重启容器后需重新执行本脚本）==="
+  echo "面板地址: http://$SERVER_IP:5090"
+  echo "默认账号: admin / admin123（登录后请修改密码）"
+  exit 0
+fi
 
 cat > /etc/systemd/system/hy2.service <<EOF
 [Unit]
@@ -99,7 +181,7 @@ After=network.target hy2.service
 WorkingDirectory=$PANEL_DIR
 Environment=HY2_SERVER_IP=$SERVER_IP
 Environment=PANEL_PORT=5090
-ExecStart=$PANEL_DIR/venv/bin/python $PANEL_DIR/app.py
+ExecStart=$PANEL_PY $PANEL_DIR/app.py
 Restart=always
 RestartSec=5
 MemoryMax=128M
