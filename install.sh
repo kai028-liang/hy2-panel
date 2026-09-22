@@ -12,7 +12,7 @@ echo "=== 1. 安装系统依赖 ==="
 if command -v apt-get >/dev/null; then
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
-  apt-get install -y -qq python3 python3-venv python3-pip openssl curl >/dev/null
+  apt-get install -y -qq python3 python3-venv openssl curl >/dev/null
 elif command -v dnf >/dev/null; then
   dnf install -y -q python3 python3-pip openssl curl >/dev/null
 else
@@ -69,7 +69,9 @@ echo "使用解释器: $BASEPY (Python $PYVER)"
 if ! "$BASEPY" -c 'import ensurepip' >/dev/null 2>&1; then
   echo "Python $PYVER 缺少 ensurepip, 尝试安装 python3-venv ..."
   if command -v apt-get >/dev/null; then
-    apt-get install -y -qq python3-venv "python3.${PYVER#3.}-venv" python3-pip >/dev/null 2>&1 || true
+    # 不装 python3-pip: Debian 13 上它连带 gcc/python3-dev 等 49 个包, 128MB 小鸡会被 OOM 杀掉;
+    # venv 的 pip 由 python3-pip-whl(随 python3-venv 依赖) 提供, 够用
+    apt-get install -y -qq python3-venv "python3.${PYVER#3.}-venv" >/dev/null 2>&1 || true
   elif command -v dnf >/dev/null; then
     dnf install -y -q python3-pip >/dev/null 2>&1 || true
   fi
