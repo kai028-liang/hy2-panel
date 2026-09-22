@@ -11,13 +11,20 @@ SINGBOX_VER="1.11.15"
 echo "=== 1. 安装系统依赖 ==="
 if command -v apt-get >/dev/null; then
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq
-  apt-get install -y -qq python3 python3-venv openssl curl >/dev/null
+  apt-get update -qq || true
+  # 逐个装: 128MB 小鸡上 apt 一次性拉大事务容易被 OOM 杀掉; 都已装过时这里是空操作
+  for p in python3 python3-venv openssl curl; do
+    dpkg -s "$p" >/dev/null 2>&1 || apt-get install -y -qq "$p" >/dev/null 2>&1 || true
+  done
 elif command -v dnf >/dev/null; then
-  dnf install -y -q python3 python3-pip openssl curl >/dev/null
+  dnf install -y -q python3 python3-pip openssl curl >/dev/null || true
 else
   echo "不支持的发行版（需要 apt 或 dnf）"; exit 1
 fi
+for c in python3 openssl curl; do
+  command -v "$c" >/dev/null || { echo "缺少 $c 且自动安装失败, 请手动安装后重跑"; exit 1; }
+done
+python3 -c 'import venv' >/dev/null 2>&1 || { echo "python3 缺 venv 模块(Debian/Ubuntu 需 python3-venv), 请手动安装后重跑"; exit 1; }
 
 echo "=== 2. 安装 sing-box ==="
 ARCH=$(uname -m)
@@ -97,10 +104,10 @@ pip_try() {  # pip_try <解释器> [额外的pip参数...]
   local src
   for src in "" "https://pypi.tuna.tsinghua.edu.cn/simple" "https://mirrors.aliyun.com/pypi/simple"; do
     if [ -z "$src" ]; then
-      "$py" -m pip install -q --timeout 20 --retries 2 "$@" flask cryptography >>/tmp/hy2-pip.log 2>&1 && return 0
+      "$py" -m pip install -q --no-cache-dir --timeout 20 --retries 2 "$@" flask cryptography >>/tmp/hy2-pip.log 2>&1 && return 0
     else
       echo "  换源重试: $src"
-      "$py" -m pip install -q --timeout 20 --retries 2 -i "$src" "$@" flask cryptography >>/tmp/hy2-pip.log 2>&1 && return 0
+      "$py" -m pip install -q --no-cache-dir --timeout 20 --retries 2 -i "$src" "$@" flask cryptography >>/tmp/hy2-pip.log 2>&1 && return 0
     fi
   done
   return 1
